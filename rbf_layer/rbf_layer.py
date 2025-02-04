@@ -238,4 +238,154 @@ class RBFLayer(nn.Module):
     def get_shapes(self):
         """ Returns the shape parameters """
         return self.log_shapes.detach().exp()
+
+
+
+class AnisotropicRBFLayer(nn.Module):
+    """
+    Anisotropic RBF Layer.
+
+    Each RBF kernel is defined by:
+      - a center c_i,
+      - a scaling matrix M_i = L_i L_i^T (which is semipositive definite),
+      - and a weight vector for combining the kernels.
+
+    The layer computes for an input x:
+
+      y(x) = sum_{i=1}^N a_i * φ( (x - c_i)^T M_i (x - c_i) )
+           = sum_{i=1}^N a_i * φ( ||L_i (x-c_i)||^2 )
+
+    Parameters:
+      in_features_dim: int
+          Dimensionality of the input.
+      num_kernels: int
+          Number of RBF kernels.
+      out_features_dim: int
+          Dimensionality of the output.
+      radial_function: Callable[[torch.Tensor], torch.Tensor]
+          The kernel function φ(·) that accepts a tensor (e.g. squared distance)
+          and returns a tensor of the same shape.
+      normalization: bool (default True)
+          If True, normalizes the RBF outputs (e.g. so that they sum to one).
+      initial_centers: Optional[torch.Tensor]
+          (num_kernels, in_features_dim) tensor to initialize kernel centers.
+      initial_weights: Optional[torch.Tensor]
+          (out_features_dim, num_kernels) tensor to initialize linear combination weights.
+      initial_L: Optional[torch.Tensor]
+          (num_kernels, in_features_dim, in_features_dim) tensor to initialize the
+          scaling matrices factors L.
+      constant_centers, constant_weights, constant_L: bool (default False)
+          If True, the corresponding parameters are not learnable.
+    """
+
+    def __init__(self,
+                 in_features_dim: int,
+                 num_kernels: int,
+                 out_features_dim: int,
+                 radial_function: Callable[[torch.Tensor], torch.Tensor],
+                 normalization: bool = True,
+                 initial_centers: torch.Tensor = None,
+                 initial_weights: torch.Tensor = None,
+                 initial_L: torch.Tensor = None,
+                 constant_centers: bool = False,
+                 constant_weights: bool = False,
+                 constant_L: bool = False):
+        super(AnisotropicRBFLayer, self).__init__()
+        self.in_features_dim = in_features_dim
+        self.num_kernels = num_kernels
+        self.out_features_dim = out_features_dim
+        self.radial_function = radial_function
+        self.normalization = normalization
+
+        # Initialize centers
+        if constant_centers:
+            assert initial_centers is not None, "initial_centers must be provided if constant_centers is True"
+            self.centers = nn.Parameter(initial_centers, requires_grad=False)
+        else:
+            self.centers = nn.Parameter(torch.zeros(num_kernels, in_features_dim))
+
+        # Initialize linear combination weights
+        if constant_weights:
+            assert initial_weights is not None, "initial_weights must be provided if constant_weights is True"
+            self.weights = nn.Parameter(initial_weights, requires_grad=False)
+        else:
+            self.weights = nn.Parameter(torch.zeros(out_features_dim, num_kernels))
+
+        # Initialize the scaling factors L for each kernel, such that M = L L^T is semipositive definite.
+        if constant_L:
+            assert initial_L is not None, "initial_L must be provided if constant_L is True"
+            self.L = nn.Parameter(initial_L, requires_grad=False)
+        else:
+            # A common initialization is to start with the identity matrix for each kernel.
+            self.L = nn.Parameter(torch.eye(in_features_dim).unsqueeze(0).repeat(num_kernels, 1, 1))
+
+        self.reset_parameters()
+
+    def reset_parameters(self, center_bound: float = 1.0, gain_weights: float = 1.0):
+        # Initialize centers uniformly in [-center_bound, center_bound]
+        if self.centers.requires_grad:
+            nn.init.uniform_(self.centers, -center_bound, center_bound)
+        # Initialize weights using Xavier initialization.
+        if self.weights.requires_grad:
+            nn.init.xavier_uniform_(self.weights, gain=gain_weights)
+        # For L, we initialize to the identity (you might add noise here if desired).
+        if self.L.requires_grad:
+            self.L.data.copy_(torch.eye(self.in_features_dim).unsqueeze(0).repeat(self.num_kernels, 1, 1))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters:
+          input: Tensor of shape (B, in_features_dim)
+
+        Returns:
+          out: Tensor of shape (B, out_features_dim)
+        """
+        batch_size = input.size(0)
+        # Compute differences: shape (B, num_kernels, in_features_dim)
+        diff = input.unsqueeze(1) - self.centers.unsqueeze(0)
+
+        # For each kernel i and each input, compute L_i (x - c_i).
+        # Using einsum: L has shape (num_kernels, in_features_dim, in_features_dim)
+        # and diff has shape (B, num_kernels, in_features_dim).
+        # The result z has shape (B, num_kernels, in_features_dim).
+        z = torch.einsum('n d e, b n e -> b n d', self.L, diff)
+
+        # Compute the squared Mahalanobis distance for each kernel:
+        # (x-c)^T M (x-c) = ||L (x-c)||^2.
+        sq_dist = (z ** 2).sum(dim=-1)  # shape: (B, num_kernels)
+
+        # Apply the radial basis function φ.
+        rbfs = self.radial_function(sq_dist)  # shape: (B, num_kernels)
+
+        # Optional normalization (e.g., to sum to 1 for each input sample).
+        if self.normalization:
+            rbfs = rbfs / (rbfs.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # Compute the final output as a weighted sum of the RBF responses.
+        # weights has shape (out_features_dim, num_kernels) and rbfs has shape (B, num_kernels).
+        out = torch.einsum('b n, o n -> b o', rbfs, self.weights)
+        return out
+
+
+if __name__ == '__main__':
+    def l_norm(x, p=2):
+        return torch.norm(x, p=p, dim=-1)
+
+
+    # Gaussian RBF
+    def rbf_gaussian(x):
+        return (-x.pow(2)).exp()
+
+
+    model = AnisotropicRBFLayer(
+        in_features_dim=3,
+        num_kernels=3,
+        out_features_dim=1,
+        radial_function=rbf_gaussian,
+    )
+    x = torch.randn(4, 3)
+    y = model(x)
+    print(y)
     
