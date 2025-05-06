@@ -385,7 +385,22 @@ if __name__ == '__main__':
         out_features_dim=1,
         radial_function=rbf_gaussian,
     )
+
+    model = nn.Sequential(
+        nn.Linear(3,10),
+        nn.Tanh(),
+        nn.Linear(10, 10),
+        nn.Tanh(),
+        AnisotropicRBFLayer(
+            in_features_dim=10,
+            num_kernels=3,
+            out_features_dim=1,
+            radial_function=rbf_gaussian,
+        )
+    )
     x = torch.randn(4, 3)
     y = model(x)
     print(y)
+
+
     
